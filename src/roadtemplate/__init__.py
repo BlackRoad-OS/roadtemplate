@@ -1,2 +1,1 @@
-"""RoadTemplate - Template Engine for BlackRoad."""
-from .template import *
+"""roadtemplate - BlackRoad OS"""

@@ -1,644 +1,435 @@
 """
 RoadTemplate - Template Engine for BlackRoad
-Template rendering with variables, conditionals, loops, and inheritance.
+Render templates with variables, loops, conditionals, and inheritance.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Pattern
 import html
-import json
 import logging
 import re
-import threading
 
 logger = logging.getLogger(__name__)
 
 
 class TemplateError(Exception):
-    """Template error."""
     pass
-
-
-class TokenType(str, Enum):
-    """Token types."""
-    TEXT = "text"
-    VARIABLE = "variable"
-    BLOCK_START = "block_start"
-    BLOCK_END = "block_end"
-    COMMENT = "comment"
 
 
 @dataclass
 class Token:
-    """A template token."""
-    type: TokenType
+    type: str
     value: str
     line: int = 0
 
 
-@dataclass
-class TemplateNode:
-    """Base template node."""
-    pass
-
-
-@dataclass
-class TextNode(TemplateNode):
-    """Text node."""
-    content: str
-
-
-@dataclass
-class VariableNode(TemplateNode):
-    """Variable node."""
-    name: str
-    filters: List[str] = field(default_factory=list)
-
-
-@dataclass
-class BlockNode(TemplateNode):
-    """Block node (if, for, etc)."""
-    block_type: str
-    expression: str
-    children: List[TemplateNode] = field(default_factory=list)
-    else_children: List[TemplateNode] = field(default_factory=list)
-
-
-class TemplateLexer:
-    """Tokenize template strings."""
-
-    VARIABLE_START = "{{"
-    VARIABLE_END = "}}"
-    BLOCK_START = "{%"
-    BLOCK_END = "%}"
-    COMMENT_START = "{#"
-    COMMENT_END = "#}"
-
-    def __init__(self, template: str):
-        self.template = template
+class Lexer:
+    def __init__(self, source: str):
+        self.source = source
         self.pos = 0
         self.line = 1
 
     def tokenize(self) -> List[Token]:
-        """Tokenize the template."""
         tokens = []
-
-        while self.pos < len(self.template):
-            if self.template[self.pos:].startswith(self.COMMENT_START):
-                self._skip_comment()
-            elif self.template[self.pos:].startswith(self.VARIABLE_START):
-                tokens.append(self._read_variable())
-            elif self.template[self.pos:].startswith(self.BLOCK_START):
-                tokens.append(self._read_block())
+        text_buffer = ""
+        
+        while self.pos < len(self.source):
+            if self.source[self.pos:self.pos+2] == "{{":
+                if text_buffer:
+                    tokens.append(Token("TEXT", text_buffer, self.line))
+                    text_buffer = ""
+                tokens.append(self._read_expression())
+            elif self.source[self.pos:self.pos+2] == "{%":
+                if text_buffer:
+                    tokens.append(Token("TEXT", text_buffer, self.line))
+                    text_buffer = ""
+                tokens.append(self._read_statement())
+            elif self.source[self.pos:self.pos+2] == "{#":
+                if text_buffer:
+                    tokens.append(Token("TEXT", text_buffer, self.line))
+                    text_buffer = ""
+                self._read_comment()
             else:
-                tokens.append(self._read_text())
-
+                if self.source[self.pos] == "\n":
+                    self.line += 1
+                text_buffer += self.source[self.pos]
+                self.pos += 1
+        
+        if text_buffer:
+            tokens.append(Token("TEXT", text_buffer, self.line))
+        
         return tokens
 
-    def _read_text(self) -> Token:
-        """Read text content."""
+    def _read_expression(self) -> Token:
+        self.pos += 2
         start = self.pos
-        while self.pos < len(self.template):
-            if any(self.template[self.pos:].startswith(s) for s in
-                   [self.VARIABLE_START, self.BLOCK_START, self.COMMENT_START]):
-                break
-            if self.template[self.pos] == '\n':
-                self.line += 1
+        while self.pos < len(self.source) and self.source[self.pos:self.pos+2] != "}}":
             self.pos += 1
+        value = self.source[start:self.pos].strip()
+        self.pos += 2
+        return Token("EXPR", value, self.line)
 
-        return Token(TokenType.TEXT, self.template[start:self.pos], self.line)
-
-    def _read_variable(self) -> Token:
-        """Read variable expression."""
-        self.pos += len(self.VARIABLE_START)
+    def _read_statement(self) -> Token:
+        self.pos += 2
         start = self.pos
-
-        while self.pos < len(self.template):
-            if self.template[self.pos:].startswith(self.VARIABLE_END):
-                value = self.template[start:self.pos].strip()
-                self.pos += len(self.VARIABLE_END)
-                return Token(TokenType.VARIABLE, value, self.line)
+        while self.pos < len(self.source) and self.source[self.pos:self.pos+2] != "%}":
             self.pos += 1
+        value = self.source[start:self.pos].strip()
+        self.pos += 2
+        return Token("STMT", value, self.line)
 
-        raise TemplateError(f"Unclosed variable at line {self.line}")
-
-    def _read_block(self) -> Token:
-        """Read block tag."""
-        self.pos += len(self.BLOCK_START)
-        start = self.pos
-
-        while self.pos < len(self.template):
-            if self.template[self.pos:].startswith(self.BLOCK_END):
-                value = self.template[start:self.pos].strip()
-                self.pos += len(self.BLOCK_END)
-
-                if value.startswith("end"):
-                    return Token(TokenType.BLOCK_END, value, self.line)
-                return Token(TokenType.BLOCK_START, value, self.line)
+    def _read_comment(self) -> None:
+        self.pos += 2
+        while self.pos < len(self.source) and self.source[self.pos:self.pos+2] != "#}":
             self.pos += 1
-
-        raise TemplateError(f"Unclosed block at line {self.line}")
-
-    def _skip_comment(self) -> None:
-        """Skip comment."""
-        self.pos += len(self.COMMENT_START)
-        while self.pos < len(self.template):
-            if self.template[self.pos:].startswith(self.COMMENT_END):
-                self.pos += len(self.COMMENT_END)
-                return
-            if self.template[self.pos] == '\n':
-                self.line += 1
-            self.pos += 1
+        self.pos += 2
 
 
-class TemplateParser:
-    """Parse tokens into AST."""
+@dataclass
+class Node:
+    pass
 
+
+@dataclass
+class TextNode(Node):
+    text: str
+
+
+@dataclass
+class ExprNode(Node):
+    expr: str
+    filters: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ForNode(Node):
+    var: str
+    iterable: str
+    body: List[Node] = field(default_factory=list)
+
+
+@dataclass
+class IfNode(Node):
+    condition: str
+    body: List[Node] = field(default_factory=list)
+    else_body: List[Node] = field(default_factory=list)
+
+
+@dataclass
+class BlockNode(Node):
+    name: str
+    body: List[Node] = field(default_factory=list)
+
+
+@dataclass
+class ExtendsNode(Node):
+    parent: str
+
+
+@dataclass
+class IncludeNode(Node):
+    template: str
+
+
+class Parser:
     def __init__(self, tokens: List[Token]):
         self.tokens = tokens
         self.pos = 0
 
-    def parse(self) -> List[TemplateNode]:
-        """Parse tokens into nodes."""
-        return self._parse_nodes()
-
-    def _parse_nodes(self, end_tags: Set[str] = None) -> List[TemplateNode]:
-        """Parse a sequence of nodes."""
-        end_tags = end_tags or set()
+    def parse(self) -> List[Node]:
         nodes = []
-
         while self.pos < len(self.tokens):
-            token = self.tokens[self.pos]
-
-            if token.type == TokenType.BLOCK_END:
-                if token.value in end_tags:
-                    return nodes
-                self.pos += 1
-                continue
-
-            if token.type == TokenType.TEXT:
-                nodes.append(TextNode(content=token.value))
-                self.pos += 1
-
-            elif token.type == TokenType.VARIABLE:
-                nodes.append(self._parse_variable(token))
-                self.pos += 1
-
-            elif token.type == TokenType.BLOCK_START:
-                nodes.append(self._parse_block(token))
-
-            else:
-                self.pos += 1
-
+            node = self._parse_node()
+            if node:
+                nodes.append(node)
         return nodes
 
-    def _parse_variable(self, token: Token) -> VariableNode:
-        """Parse variable with filters."""
-        parts = token.value.split("|")
-        name = parts[0].strip()
-        filters = [f.strip() for f in parts[1:]]
-        return VariableNode(name=name, filters=filters)
-
-    def _parse_block(self, token: Token) -> BlockNode:
-        """Parse a block tag."""
+    def _parse_node(self) -> Optional[Node]:
+        if self.pos >= len(self.tokens):
+            return None
+        
+        token = self.tokens[self.pos]
+        
+        if token.type == "TEXT":
+            self.pos += 1
+            return TextNode(text=token.value)
+        elif token.type == "EXPR":
+            self.pos += 1
+            parts = token.value.split("|")
+            expr = parts[0].strip()
+            filters = [f.strip() for f in parts[1:]]
+            return ExprNode(expr=expr, filters=filters)
+        elif token.type == "STMT":
+            return self._parse_statement(token)
+        
         self.pos += 1
-        parts = token.value.split(None, 1)
-        block_type = parts[0]
-        expression = parts[1] if len(parts) > 1 else ""
-
-        if block_type == "if":
-            return self._parse_if(expression)
-        elif block_type == "for":
-            return self._parse_for(expression)
-        elif block_type == "block":
-            return self._parse_named_block(expression)
-        else:
-            return BlockNode(block_type=block_type, expression=expression)
-
-    def _parse_if(self, expression: str) -> BlockNode:
-        """Parse if block."""
-        node = BlockNode(block_type="if", expression=expression)
-        node.children = self._parse_nodes({"endif", "else", "elif"})
-
-        while self.pos < len(self.tokens):
-            token = self.tokens[self.pos]
-            if token.type == TokenType.BLOCK_END:
-                if token.value == "endif":
-                    self.pos += 1
-                    break
-                elif token.value == "else":
-                    self.pos += 1
-                    node.else_children = self._parse_nodes({"endif"})
-                elif token.value.startswith("elif"):
-                    # Handle elif as nested if in else
-                    pass
-            self.pos += 1
-
-        return node
-
-    def _parse_for(self, expression: str) -> BlockNode:
-        """Parse for loop."""
-        node = BlockNode(block_type="for", expression=expression)
-        node.children = self._parse_nodes({"endfor", "else"})
-
-        while self.pos < len(self.tokens):
-            token = self.tokens[self.pos]
-            if token.type == TokenType.BLOCK_END:
-                if token.value == "endfor":
-                    self.pos += 1
-                    break
-                elif token.value == "else":
-                    self.pos += 1
-                    node.else_children = self._parse_nodes({"endfor"})
-            self.pos += 1
-
-        return node
-
-    def _parse_named_block(self, name: str) -> BlockNode:
-        """Parse named block for inheritance."""
-        node = BlockNode(block_type="block", expression=name)
-        node.children = self._parse_nodes({"endblock"})
-
-        if self.pos < len(self.tokens):
-            self.pos += 1
-
-        return node
-
-
-class TemplateContext:
-    """Template rendering context."""
-
-    def __init__(self, data: Dict[str, Any] = None):
-        self.stack: List[Dict[str, Any]] = [data or {}]
-
-    def push(self, data: Dict[str, Any]) -> None:
-        """Push new scope."""
-        self.stack.append(data)
-
-    def pop(self) -> None:
-        """Pop scope."""
-        if len(self.stack) > 1:
-            self.stack.pop()
-
-    def get(self, name: str) -> Any:
-        """Get variable from context."""
-        parts = name.split(".")
-
-        # Search stack from top to bottom
-        for scope in reversed(self.stack):
-            value = scope
-            try:
-                for part in parts:
-                    if isinstance(value, dict):
-                        value = value.get(part)
-                    elif hasattr(value, part):
-                        value = getattr(value, part)
-                    else:
-                        value = None
-                        break
-                if value is not None:
-                    return value
-            except (KeyError, AttributeError, TypeError):
-                continue
-
         return None
 
-    def set(self, name: str, value: Any) -> None:
-        """Set variable in current scope."""
-        self.stack[-1][name] = value
+    def _parse_statement(self, token: Token) -> Optional[Node]:
+        parts = token.value.split(None, 1)
+        keyword = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        
+        if keyword == "for":
+            return self._parse_for(rest)
+        elif keyword == "if":
+            return self._parse_if(rest)
+        elif keyword == "block":
+            return self._parse_block(rest)
+        elif keyword == "extends":
+            self.pos += 1
+            return ExtendsNode(parent=rest.strip().strip("'\""))
+        elif keyword == "include":
+            self.pos += 1
+            return IncludeNode(template=rest.strip().strip("'\""))
+        elif keyword in ("endif", "endfor", "endblock", "else"):
+            return None
+        
+        self.pos += 1
+        return None
+
+    def _parse_for(self, rest: str) -> ForNode:
+        match = re.match(r"(\w+)\s+in\s+(.+)", rest)
+        if not match:
+            raise TemplateError(f"Invalid for syntax: {rest}")
+        
+        var, iterable = match.groups()
+        self.pos += 1
+        body = []
+        
+        while self.pos < len(self.tokens):
+            token = self.tokens[self.pos]
+            if token.type == "STMT" and token.value.strip() == "endfor":
+                self.pos += 1
+                break
+            node = self._parse_node()
+            if node:
+                body.append(node)
+        
+        return ForNode(var=var, iterable=iterable.strip(), body=body)
+
+    def _parse_if(self, condition: str) -> IfNode:
+        self.pos += 1
+        body = []
+        else_body = []
+        in_else = False
+        
+        while self.pos < len(self.tokens):
+            token = self.tokens[self.pos]
+            if token.type == "STMT":
+                if token.value.strip() == "endif":
+                    self.pos += 1
+                    break
+                elif token.value.strip() == "else":
+                    in_else = True
+                    self.pos += 1
+                    continue
+            
+            node = self._parse_node()
+            if node:
+                if in_else:
+                    else_body.append(node)
+                else:
+                    body.append(node)
+        
+        return IfNode(condition=condition.strip(), body=body, else_body=else_body)
+
+    def _parse_block(self, name: str) -> BlockNode:
+        self.pos += 1
+        body = []
+        
+        while self.pos < len(self.tokens):
+            token = self.tokens[self.pos]
+            if token.type == "STMT" and token.value.strip() == "endblock":
+                self.pos += 1
+                break
+            node = self._parse_node()
+            if node:
+                body.append(node)
+        
+        return BlockNode(name=name.strip(), body=body)
 
 
-class TemplateFilters:
-    """Built-in template filters."""
-
-    @staticmethod
-    def escape(value: Any) -> str:
-        """HTML escape."""
-        return html.escape(str(value))
-
-    @staticmethod
-    def upper(value: Any) -> str:
-        """Uppercase."""
-        return str(value).upper()
-
-    @staticmethod
-    def lower(value: Any) -> str:
-        """Lowercase."""
-        return str(value).lower()
-
-    @staticmethod
-    def title(value: Any) -> str:
-        """Title case."""
-        return str(value).title()
-
-    @staticmethod
-    def trim(value: Any) -> str:
-        """Trim whitespace."""
-        return str(value).strip()
-
-    @staticmethod
-    def default(value: Any, default_value: str = "") -> str:
-        """Default value if None/empty."""
-        return str(value) if value else default_value
-
-    @staticmethod
-    def length(value: Any) -> int:
-        """Get length."""
-        return len(value) if value else 0
-
-    @staticmethod
-    def join(value: List, separator: str = ", ") -> str:
-        """Join list."""
-        return separator.join(str(v) for v in value)
-
-    @staticmethod
-    def first(value: List) -> Any:
-        """Get first item."""
-        return value[0] if value else None
-
-    @staticmethod
-    def last(value: List) -> Any:
-        """Get last item."""
-        return value[-1] if value else None
-
-    @staticmethod
-    def json(value: Any) -> str:
-        """JSON encode."""
-        return json.dumps(value)
-
-    @staticmethod
-    def date(value: datetime, fmt: str = "%Y-%m-%d") -> str:
-        """Format date."""
-        if isinstance(value, datetime):
-            return value.strftime(fmt)
-        return str(value)
-
-
-class TemplateRenderer:
-    """Render template AST."""
-
+class Environment:
     def __init__(self):
+        self.templates: Dict[str, str] = {}
+        self.globals: Dict[str, Any] = {}
         self.filters: Dict[str, Callable] = {
-            "escape": TemplateFilters.escape,
-            "e": TemplateFilters.escape,
-            "upper": TemplateFilters.upper,
-            "lower": TemplateFilters.lower,
-            "title": TemplateFilters.title,
-            "trim": TemplateFilters.trim,
-            "default": TemplateFilters.default,
-            "length": TemplateFilters.length,
-            "join": TemplateFilters.join,
-            "first": TemplateFilters.first,
-            "last": TemplateFilters.last,
-            "json": TemplateFilters.json,
-            "date": TemplateFilters.date
+            "upper": lambda x: str(x).upper(),
+            "lower": lambda x: str(x).lower(),
+            "title": lambda x: str(x).title(),
+            "escape": lambda x: html.escape(str(x)),
+            "trim": lambda x: str(x).strip(),
+            "length": lambda x: len(x),
+            "default": lambda x, d="": x if x else d,
+            "join": lambda x, sep=",": sep.join(str(i) for i in x),
+            "first": lambda x: x[0] if x else None,
+            "last": lambda x: x[-1] if x else None,
         }
 
-    def add_filter(self, name: str, fn: Callable) -> None:
-        """Add custom filter."""
-        self.filters[name] = fn
-
-    def render(self, nodes: List[TemplateNode], context: TemplateContext) -> str:
-        """Render nodes to string."""
-        output = []
-
-        for node in nodes:
-            if isinstance(node, TextNode):
-                output.append(node.content)
-            elif isinstance(node, VariableNode):
-                output.append(self._render_variable(node, context))
-            elif isinstance(node, BlockNode):
-                output.append(self._render_block(node, context))
-
-        return "".join(output)
-
-    def _render_variable(self, node: VariableNode, context: TemplateContext) -> str:
-        """Render a variable."""
-        value = context.get(node.name)
-
-        for filter_name in node.filters:
-            filter_fn = self.filters.get(filter_name)
-            if filter_fn:
-                value = filter_fn(value)
-
-        return str(value) if value is not None else ""
-
-    def _render_block(self, node: BlockNode, context: TemplateContext) -> str:
-        """Render a block."""
-        if node.block_type == "if":
-            return self._render_if(node, context)
-        elif node.block_type == "for":
-            return self._render_for(node, context)
-        elif node.block_type == "block":
-            return self.render(node.children, context)
-        return ""
-
-    def _render_if(self, node: BlockNode, context: TemplateContext) -> str:
-        """Render if block."""
-        condition = self._evaluate_condition(node.expression, context)
-
-        if condition:
-            return self.render(node.children, context)
-        elif node.else_children:
-            return self.render(node.else_children, context)
-        return ""
-
-    def _evaluate_condition(self, expression: str, context: TemplateContext) -> bool:
-        """Evaluate a condition expression."""
-        # Simple evaluation - in production use a proper expression parser
-        parts = expression.split()
-
-        if len(parts) == 1:
-            value = context.get(parts[0])
-            return bool(value)
-
-        if len(parts) == 3:
-            left = context.get(parts[0]) or parts[0]
-            op = parts[1]
-            right = context.get(parts[2]) or parts[2]
-
-            # Strip quotes from string literals
-            if isinstance(right, str) and right.startswith('"') and right.endswith('"'):
-                right = right[1:-1]
-
-            if op == "==":
-                return left == right
-            elif op == "!=":
-                return left != right
-            elif op == ">":
-                return left > right
-            elif op == "<":
-                return left < right
-            elif op == ">=":
-                return left >= right
-            elif op == "<=":
-                return left <= right
-
-        return bool(context.get(expression))
-
-    def _render_for(self, node: BlockNode, context: TemplateContext) -> str:
-        """Render for loop."""
-        # Parse expression: "item in items"
-        match = re.match(r'(\w+)\s+in\s+(\w+)', node.expression)
-        if not match:
-            return ""
-
-        var_name = match.group(1)
-        iterable_name = match.group(2)
-        iterable = context.get(iterable_name)
-
-        if not iterable:
-            return self.render(node.else_children, context) if node.else_children else ""
-
-        output = []
-        for i, item in enumerate(iterable):
-            context.push({
-                var_name: item,
-                "loop": {
-                    "index": i + 1,
-                    "index0": i,
-                    "first": i == 0,
-                    "last": i == len(iterable) - 1,
-                    "length": len(iterable)
-                }
-            })
-            output.append(self.render(node.children, context))
-            context.pop()
-
-        return "".join(output)
-
-
-class Template:
-    """A compiled template."""
-
-    def __init__(self, source: str, name: str = None):
-        self.source = source
-        self.name = name or "template"
-        self.nodes: List[TemplateNode] = []
-        self._compile()
-
-    def _compile(self) -> None:
-        """Compile the template."""
-        lexer = TemplateLexer(self.source)
-        tokens = lexer.tokenize()
-        parser = TemplateParser(tokens)
-        self.nodes = parser.parse()
-
-    def render(self, data: Dict[str, Any] = None, renderer: TemplateRenderer = None) -> str:
-        """Render the template."""
-        renderer = renderer or TemplateRenderer()
-        context = TemplateContext(data or {})
-        return renderer.render(self.nodes, context)
-
-
-class TemplateLoader:
-    """Load templates from various sources."""
-
-    def __init__(self, search_paths: List[str] = None):
-        self.search_paths = search_paths or ["."]
-        self.cache: Dict[str, Template] = {}
-        self._lock = threading.Lock()
-
-    def load(self, name: str) -> Template:
-        """Load a template by name."""
-        with self._lock:
-            if name in self.cache:
-                return self.cache[name]
-
-        # In production, search file system
-        # For now, return None
-        raise TemplateError(f"Template not found: {name}")
-
-    def from_string(self, source: str, name: str = None) -> Template:
-        """Create template from string."""
-        template = Template(source, name)
-        if name:
-            with self._lock:
-                self.cache[name] = template
-        return template
-
-
-class TemplateEngine:
-    """High-level template engine."""
-
-    def __init__(self):
-        self.loader = TemplateLoader()
-        self.renderer = TemplateRenderer()
-        self.globals: Dict[str, Any] = {}
+    def add_template(self, name: str, source: str) -> None:
+        self.templates[name] = source
 
     def add_global(self, name: str, value: Any) -> None:
-        """Add global variable."""
         self.globals[name] = value
 
     def add_filter(self, name: str, fn: Callable) -> None:
-        """Add custom filter."""
-        self.renderer.add_filter(name, fn)
+        self.filters[name] = fn
 
-    def render_string(self, source: str, data: Dict[str, Any] = None) -> str:
-        """Render template string."""
-        template = self.loader.from_string(source)
-        merged_data = {**self.globals, **(data or {})}
-        return template.render(merged_data, self.renderer)
-
-    def render(self, template_name: str, data: Dict[str, Any] = None) -> str:
-        """Render named template."""
-        template = self.loader.load(template_name)
-        merged_data = {**self.globals, **(data or {})}
-        return template.render(merged_data, self.renderer)
+    def get_template(self, name: str) -> "Template":
+        if name not in self.templates:
+            raise TemplateError(f"Template not found: {name}")
+        return Template(self.templates[name], self)
 
 
-# Example usage
+class Template:
+    def __init__(self, source: str, env: Environment = None):
+        self.source = source
+        self.env = env or Environment()
+        self.lexer = Lexer(source)
+        self.tokens = self.lexer.tokenize()
+        self.parser = Parser(self.tokens)
+        self.nodes = self.parser.parse()
+
+    def render(self, context: Dict[str, Any] = None) -> str:
+        ctx = {**self.env.globals, **(context or {})}
+        return self._render_nodes(self.nodes, ctx)
+
+    def _render_nodes(self, nodes: List[Node], context: Dict[str, Any]) -> str:
+        result = []
+        blocks = {}
+        parent = None
+        
+        for node in nodes:
+            if isinstance(node, ExtendsNode):
+                parent = node.parent
+            elif isinstance(node, BlockNode):
+                blocks[node.name] = node
+            else:
+                result.append(self._render_node(node, context, blocks))
+        
+        if parent:
+            parent_template = self.env.get_template(parent)
+            parent_ctx = {**context, "__blocks__": blocks}
+            return parent_template._render_with_blocks(parent_ctx, blocks)
+        
+        return "".join(result)
+
+    def _render_with_blocks(self, context: Dict[str, Any], child_blocks: Dict[str, BlockNode]) -> str:
+        result = []
+        for node in self.nodes:
+            if isinstance(node, BlockNode):
+                if node.name in child_blocks:
+                    result.append(self._render_nodes(child_blocks[node.name].body, context))
+                else:
+                    result.append(self._render_nodes(node.body, context))
+            else:
+                result.append(self._render_node(node, context, child_blocks))
+        return "".join(result)
+
+    def _render_node(self, node: Node, context: Dict[str, Any], blocks: Dict[str, BlockNode] = None) -> str:
+        if isinstance(node, TextNode):
+            return node.text
+        elif isinstance(node, ExprNode):
+            return self._eval_expr(node, context)
+        elif isinstance(node, ForNode):
+            return self._render_for(node, context, blocks)
+        elif isinstance(node, IfNode):
+            return self._render_if(node, context, blocks)
+        elif isinstance(node, IncludeNode):
+            return self.env.get_template(node.template).render(context)
+        elif isinstance(node, BlockNode):
+            return self._render_nodes(node.body, context)
+        return ""
+
+    def _eval_expr(self, node: ExprNode, context: Dict[str, Any]) -> str:
+        value = self._resolve(node.expr, context)
+        for filter_name in node.filters:
+            if filter_name in self.env.filters:
+                value = self.env.filters[filter_name](value)
+        return str(value) if value is not None else ""
+
+    def _resolve(self, expr: str, context: Dict[str, Any]) -> Any:
+        parts = expr.split(".")
+        value = context.get(parts[0])
+        for part in parts[1:]:
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+        return value
+
+    def _render_for(self, node: ForNode, context: Dict[str, Any], blocks: Dict[str, BlockNode]) -> str:
+        iterable = self._resolve(node.iterable, context)
+        if not iterable:
+            return ""
+        result = []
+        items = list(iterable)
+        for i, item in enumerate(items):
+            loop_ctx = {
+                **context,
+                node.var: item,
+                "loop": {"index": i + 1, "index0": i, "first": i == 0, "last": i == len(items) - 1, "length": len(items)}
+            }
+            result.append(self._render_nodes(node.body, loop_ctx))
+        return "".join(result)
+
+    def _render_if(self, node: IfNode, context: Dict[str, Any], blocks: Dict[str, BlockNode]) -> str:
+        value = self._resolve(node.condition, context)
+        if value:
+            return self._render_nodes(node.body, context)
+        return self._render_nodes(node.else_body, context)
+
+
+class TemplateLoader:
+    def __init__(self, base_path: str = ""):
+        self.base_path = base_path
+        self.env = Environment()
+
+    def load(self, name: str) -> Template:
+        import os
+        path = os.path.join(self.base_path, name)
+        with open(path, "r") as f:
+            source = f.read()
+        self.env.add_template(name, source)
+        return self.env.get_template(name)
+
+
 def example_usage():
-    """Example template usage."""
-    engine = TemplateEngine()
-
-    # Add global
-    engine.add_global("site_name", "BlackRoad")
-
-    # Simple variable
-    result = engine.render_string("Hello, {{ name }}!", {"name": "World"})
-    print(result)
-
-    # Filters
-    result = engine.render_string(
-        "{{ message | upper | trim }}",
-        {"message": "  hello world  "}
-    )
-    print(result)
-
-    # Conditionals
-    template = """
-{% if user.admin %}
-Welcome, Admin {{ user.name }}!
-{% else %}
-Welcome, {{ user.name }}!
-{% endif %}
-"""
-    result = engine.render_string(template, {"user": {"name": "Alice", "admin": True}})
-    print(result.strip())
-
-    # Loops
-    template = """
+    env = Environment()
+    env.add_template("base.html", """
+<!DOCTYPE html>
+<html>
+<head><title>{% block title %}Default{% endblock %}</title></head>
+<body>{% block content %}{% endblock %}</body>
+</html>
+""")
+    
+    env.add_template("page.html", """
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
 <ul>
 {% for item in items %}
-<li>{{ loop.index }}. {{ item.name }} - ${{ item.price }}</li>
+<li>{{ loop.index }}. {{ item.name|upper }}</li>
 {% endfor %}
 </ul>
-"""
-    result = engine.render_string(template, {
-        "items": [
-            {"name": "Widget", "price": 9.99},
-            {"name": "Gadget", "price": 19.99}
-        ]
+{% if show_footer %}
+<footer>Footer content</footer>
+{% endif %}
+{% endblock %}
+""")
+    
+    template = env.get_template("page.html")
+    output = template.render({
+        "title": "My Page",
+        "items": [{"name": "Apple"}, {"name": "Banana"}, {"name": "Cherry"}],
+        "show_footer": True
     })
-    print(result)
-
-    # Nested access
-    result = engine.render_string(
-        "{{ user.profile.email }}",
-        {"user": {"profile": {"email": "test@example.com"}}}
-    )
-    print(result)
+    print(output)
 
